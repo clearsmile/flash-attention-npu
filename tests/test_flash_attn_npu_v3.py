@@ -5,10 +5,7 @@ import os
 import torch
 import torch_npu
 import pytest
-if "Ascend950" in torch_npu.npu.get_device_name():
-    from flash_attn_npu_v3 import flash_attn_with_kvcache
-else:
-    from flash_attn_npu_v3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_v3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
@@ -545,8 +542,13 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_func only support Ascend910")
+    if "Ascend950" in name:
+        if head_size not in (64, 128):
+            pytest.skip("Ascend950 only supports head_dim 64 or 128")
+        if softcap > 0:
+            pytest.skip("Ascend950 does not support softcap")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -627,8 +629,15 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
 def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_varlen_func only support Ascend910")
+    if "Ascend950" in name:
+        if head_size not in (64, 128):
+            pytest.skip("Ascend950 only supports head_dim 64 or 128")
+        if softcap > 0:
+            pytest.skip("Ascend950 does not support softcap")
+        if window_size_left != -1 or window_size_right != -1:
+            pytest.skip("Ascend950 does not support SWA (sliding window)")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_varlen_func only supports Ascend910/Ascend950")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
