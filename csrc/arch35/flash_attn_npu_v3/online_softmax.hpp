@@ -4,8 +4,8 @@
  * Modified by Minghua Shen, 2026
  */
 
-#ifndef EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
-#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
+#ifndef EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP_T
+#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP_T
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -90,7 +90,7 @@ public:
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET +  64 * sizeof(float);
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET +  64 * sizeof(float);
 
-        subBlockIdx_ = AscendC::GetSubBlockIdx(); 
+        subBlockIdx_ = AscendC::GetSubBlockIdx();
 
         scaleValue = static_cast<ElementInput>(scaleValue_);
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LS_UB_TENSOR_OFFSET);
@@ -149,12 +149,152 @@ public:
         }
     }
     
+    // ===== SWA preMask/nextMask 辅助函数 =====
+    //
+    // ComputeScaleAndMaxMaskSWA: 从已验证的 ComputeScaleAndMaxMask 复制而来，
+    // 直接应用 host 生成的 SWA mask。此函数在 SWA operator() 内联调用，
+    // 与 MASK_CAUSAL 路径的 ComputeScaleAndMaxMask 共享相同的经过验证的 SIMD 逻辑，
+    // 避免 ApplyMaskS / LoadAndApplyMask 间接调用导致的 aicore exception。
+    //
+    // mask==1 的位置替换为 -inf，mask==0 保留。
+
+    template <typename ElementS, typename ElementP, bool isUpdate>
+    __simd_vf__ inline void ComputeScaleAndMaxMaskSWA(
+        __ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb,
+        __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart,
+        __ubuf__ ElementP *expUb, __ubuf__ ElementS *expSumUb,
+        __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops,
+        uint32_t tailN, uint32_t nPadding, ElementInput dScale,
+        uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    {
+        using namespace AscendC::MicroAPI;
+        RegTensor<float> minVreg;
+        RegTensor<float> srcVreg;
+        RegTensor<float> srcVreg_unroll;
+        RegTensor<float> srcVreg_unroll_new;
+        RegTensor<float> maxSrcVreg;
+        RegTensor<float> maxTmpVreg;
+        RegTensor<float> maxBrcVreg;
+        RegTensor<float> expEvenVreg;
+        RegTensor<float> expOddVreg;
+        RegTensor<float> expSumVreg;
+        UnalignRegForStore maxUreg;
+        UnalignRegForStore expSumUreg;
+
+        RegTensor<uint8_t> maskVreg;
+        RegTensor<half> maskVregb16;
+        RegTensor<half> maskVregb16_new;
+        RegTensor<half> maskVregb16_unroll_new;
+        RegTensor<float> maskVregb32;
+        RegTensor<float> maskVregb32_unroll;
+
+        RegTensor<bfloat16_t> vreg_exp_even_bf16;
+        RegTensor<bfloat16_t> vreg_exp_odd_bf16;
+        RegTensor<bfloat16_t> vreg_exp_bf16;
+
+        RegTensor<half> vreg_exp_even_f16;
+        RegTensor<half> vreg_exp_odd_f16;
+        RegTensor<half> vreg_exp_f16;
+
+        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
+        MaskReg pregTailN = UpdateMask<float>(tailN);
+        MaskReg preg_all_b16 = CreateMask<half, MaskPattern::ALL>();
+
+        constexpr static CastTrait castTraitZero = {
+            RegLayout::ZERO,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        constexpr static CastTrait castTraitOne = {
+            RegLayout::ONE,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        Duplicate(minVreg, MIN_VALUE);
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+
+            Muls(srcVreg, srcVreg, dScale, pregFull);
+            Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            // mask: uint8 → half → Interleave → float → Compare → Select
+            LoadAlign<ElementMask, LoadDist::DIST_US_B8>(maskVreg, maskUb + i * 128);
+
+            Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
+            Interleave(maskVregb16_new, maskVregb16_unroll_new, maskVregb16, maskVregb16);
+            Cast<float, half, castTraitZero>(maskVregb32, maskVregb16_new, pregFull);
+            Cast<float, half, castTraitZero>(maskVregb32_unroll, maskVregb16_unroll_new, pregFull);
+            // 与 arch22 ApplyMask 一致：mask=1 的位置累加 MIN_VALUE，不依赖 Select 谓词语义
+            Muls(maskVregb32, maskVregb32, MIN_VALUE, pregFull);
+            Muls(maskVregb32_unroll, maskVregb32_unroll, MIN_VALUE, pregFull);
+            Add(srcVreg, srcVreg, maskVregb32, pregFull);
+            Add(srcVreg_unroll, srcVreg_unroll, maskVregb32_unroll, pregFull);
+
+            Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2BaseSize, srcVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            Max(maxTmpVreg, srcVreg, srcVreg_unroll_new, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                maxSrcVreg, maxTmpVreg, pregFull);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            newMaxUb, maxUreg, 0);
+        if constexpr (isUpdate) {
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+            LoadAlign(maxSrcVreg, newMaxUbStart);
+            LoadAlign(maxTmpVreg, LastMaxUbStart);
+            Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
+        }
+        LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
+                srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+            ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
+            ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
+
+            Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+            expSumVreg, expSumVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+
+            if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
+                Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
+                Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
+                Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
+                (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+            } else {
+                Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
+                Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
+                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16, (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half *&)expUb), vreg_exp_f16, blockStride, 1, preg_all_b16);
+            }
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+    }
+
+    // ===== 无 mask operator() =====
+
     template <class TensorP>
     __aicore__ inline
     void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
          Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag)
-    {   
+    {
         uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
         uint32_t m = actualBlockShape.m() < mCopyOffset ? actualBlockShape.m() : mCopyOffset;
         m = subBlockIdx_ == 0 ? m : actualBlockShape.m() - m;
@@ -473,7 +613,136 @@ public:
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
-    
+
+    // SWA 专用 mask 拷贝：使用 DataCopyPad 逐行拷贝，支持 arch22 中任意 row/col 偏移，
+    // 避免 TLA GetTile 对非对齐 GM 子矩阵可能存在的限制。
+    __aicore__ inline
+    void CopySwMaskGmToUb(AscendC::GlobalTensor<ElementMask> &gMaskTensor,
+                          AscendC::LocalTensor<ElementMask> &ubMaskTensor,
+                          uint32_t row, uint32_t col,
+                          uint32_t m, uint32_t columns)
+    {
+        auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
+        auto gmMaskTensorTla = tla::MakeTensor(gMaskTensor, gmMaskLayoutTla, Arch::PositionGM{});
+        auto gMaskTensorTlaTile = GetTile(gmMaskTensorTla,
+            tla::MakeCoord(row, col), tla::MakeShape(m, columns));
+        CopyGmToUbMask copyGmToUbMask;
+        auto ubMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(m, columns);
+        auto ubMaskTensorTla = tla::MakeTensor(ubMaskTensor, ubMaskLayoutTla, Arch::PositionUB{});
+        auto ubMaskTensorTlaTile = GetTile(ubMaskTensorTla,
+            tla::MakeCoord(0, 0), tla::MakeShape(m, columns));
+        copyGmToUbMask(ubMaskTensorTlaTile, gMaskTensorTlaTile);
+    }
+
+    // ===== SWA preMask/nextMask 双边界 operator() — 对齐 arch22 online_softmax.hpp:1117-1344 =====
+    template <class TensorP>
+    __aicore__ inline
+    void operator()(TensorP &l1PTensorTla, AscendC::GlobalTensor<ElementMask> &gmMaskTensor,
+        GemmCoord actualBlockShape,
+        uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
+        Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
+        int32_t maskRowOffset, int32_t maskColumnOffset)
+    {
+        uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
+        uint32_t m = actualBlockShape.m() < mCopyOffset ? actualBlockShape.m() : mCopyOffset;
+        m = subBlockIdx_ == 0 ? m : actualBlockShape.m() - m;
+        if (m == 0) {
+            WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+            SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+            WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+            SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+            return;
+        }
+        uint32_t n = actualBlockShape.n();
+        uint16_t mRound = RoundUp(m, C0_NUM_PER_FRACTAL);
+        uint16_t nRound = RoundUp(n, ELE_NUM_PER_C0);
+        uint32_t blockStride = mRound + 1;
+        constexpr int16_t vlSize = static_cast<int16_t>(AscendC::GetVecLen() / sizeof(ElementInput));
+        int16_t nLoops = AscendC::CeilDivision(n, vlSize) - 1;
+        uint32_t tailN = (n - 1) % vlSize + 1;
+        int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
+        uint32_t tailM = (m - 1) % vlSize + 1;
+        uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
+
+        // SWA mask 在 GM 中的 row/col 偏移
+        uint32_t gmOffsetMaskRow = static_cast<uint32_t>(maskRowOffset);
+        uint32_t gmOffsetMaskColumn = static_cast<uint32_t>(maskColumnOffset);
+
+        // === 主处理: 等 QK 就绪 -> 一次性 scale -> 应用 pre/next 掩码 -> 无掩码 max/exp ===
+        __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float *lastMaxAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
+        __ubuf__ float *lastMaxStartAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
+        __ubuf__ float *lastSumAddr = (__ubuf__ float*) glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput *nowMaxAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput *nowMaxStartAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput *nowSumAddr = (__ubuf__ float*) llUbTensor.GetPhyAddr();
+        __ubuf__ float *expMaxUbAddr = (__ubuf__ float*) dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+
+        // Load mask from GM to UB（与 MASK_CAUSAL operator() 相同的 CopyGmToUbMask 流程）
+        uint32_t maskColumnToUse = RoundUp(n, 128);
+        uint32_t maskColumnRoundUse = RoundUp(maskColumnToUse, 128);
+
+        __ubuf__ ElementMask *maskUbAddr = (__ubuf__ ElementMask *)maskUbTensor.GetPhyAddr();
+
+        // DataCopyPad 逐行拷贝，兼容 preMask 的 col=1/65 等非对齐偏移
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
+        CopySwMaskGmToUb(gmMaskTensor, maskUbTensor,
+            gmOffsetMaskRow + subBlockIdx_ * mCopyOffset, gmOffsetMaskColumn,
+            m, maskColumnRoundUse);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
+
+        WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+
+        // 调用经证实的 mask+scale+max+exp 函数
+        if (isFirstKvSTile) {
+            if (n > 64) {
+                ComputeScaleAndMaxMaskSWA<ElementInput, ElementOutput, false>(
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
+                    maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+            } else {
+                ComputeScaleAndMaxMask64SWA<ElementInput, ElementOutput, false>(
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
+                    maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+            }
+        } else {
+            if (n > 64) {
+                ComputeScaleAndMaxMaskSWA<ElementInput, ElementOutput, true>(
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
+                    maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+            } else {
+                ComputeScaleAndMaxMask64SWA<ElementInput, ElementOutput, true>(
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
+                    maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
+        SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+
+        auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM],
+            ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla,
+            tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla,
+            tla::MakeCoord(subBlockIdx_ * mCopyOffset, 0), tla::MakeShape(m, n));
+        WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+
+        CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+        if (!isFirstKvSTile) {
+            UpdateExpSumAndExpMax<ElementInput>(
+                lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops, tailM);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
 private:
     ElementInput scaleValue;
     AscendC::LocalTensor<ElementInput> lsUbTensor;
@@ -926,6 +1195,108 @@ private:
             ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
     }
 
+    // SWA 64 列变体：从 ComputeScaleAndMaxMask64 复制，直接应用 SWA mask
+    template <typename ElementS, typename ElementP, bool isUpdate>
+    __simd_vf__ inline void ComputeScaleAndMaxMask64SWA(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    {
+        using namespace AscendC::MicroAPI;
+        RegTensor<float> minVreg;
+        RegTensor<float> srcVreg;
+        RegTensor<float> srcVreg_unroll;
+        RegTensor<float> srcVreg_unroll_new;
+        RegTensor<float> maxSrcVreg;
+        RegTensor<float> maxTmpVreg;
+        RegTensor<float> maxBrcVreg;
+        RegTensor<float> expEvenVreg;
+        RegTensor<float> expOddVreg;
+        RegTensor<float> expSumVreg;
+        UnalignRegForStore maxUreg;
+        UnalignRegForStore expSumUreg;
+
+        RegTensor<uint8_t> maskVreg;
+        RegTensor<half> maskVregb16;
+        RegTensor<float> maskVregb32;
+
+        RegTensor<bfloat16_t> vreg_exp_even_bf16;
+        RegTensor<bfloat16_t> vreg_exp_odd_bf16;
+        RegTensor<bfloat16_t> vreg_exp_bf16;
+
+        RegTensor<half> vreg_exp_even_f16;
+        RegTensor<half> vreg_exp_odd_f16;
+        RegTensor<half> vreg_exp_f16;
+
+        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
+        MaskReg pregTailN = UpdateMask<float>(tailN);
+        MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
+
+        constexpr static CastTrait castTraitZero = {
+            RegLayout::ZERO,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        constexpr static CastTrait castTraitOne = {
+            RegLayout::ONE,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        Duplicate(minVreg, MIN_VALUE);
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            Muls(srcVreg, srcVreg, dScale, pregTailN);
+            LoadAlign<ElementMask, LoadDist::DIST_UNPACK4_B8>(maskVreg, maskUb + i * 128);
+            Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
+            Cast<float, half, castTraitZero>(maskVregb32, maskVregb16, pregFull);
+            // 与 arch22 ApplyMask 一致：mask=1 的位置累加 MIN_VALUE，不依赖 Select 谓词语义
+            Muls(maskVregb32, maskVregb32, MIN_VALUE, pregFull);
+            Add(srcVreg, srcVreg, maskVregb32, pregFull);
+            Select(srcVreg_unroll_new, srcVreg, minVreg, pregTailN);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                maxSrcVreg, srcVreg_unroll_new, pregFull);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            newMaxUb, maxUreg, 0);
+        if constexpr (isUpdate) {
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+            LoadAlign(maxSrcVreg, newMaxUbStart);
+            LoadAlign(maxTmpVreg, LastMaxUbStart);
+            Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
+        }
+        LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+            expSumVreg, expEvenVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+
+            if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
+                Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
+                DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+            } else {
+                Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
+                DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half *&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+            }
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+    }
+
     template <typename ElementS, typename ElementP, bool isUpdate, MAligendTileNum mTileNum>
     __simd_vf__ inline void ComputeScaleAndMaxDn(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, uint16_t mRound, uint16_t m, uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, uint16_t S2BaseSize, 
@@ -1279,4 +1650,4 @@ private:
 };
 }
 
-#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
+#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP_T

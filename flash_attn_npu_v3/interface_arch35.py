@@ -38,6 +38,25 @@ def _maybe_contiguous(x):
     """Make sure the inner-most stride is 1; the kernel asserts it."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+
+def _normalize_window_size(window_size, causal=False):
+    """Normalize window_size to match NV flash-attn semantics.
+
+    - causal=True forces the right window to 0.
+    - A negative left window is treated as unbounded on the left.
+    - A negative right window is treated as unbounded on the right.
+    """
+    assert len(window_size) == 2, "window_size must be (left, right)"
+    window_size_left, window_size_right = window_size
+    if causal:
+        window_size_right = 0
+    if window_size_left < 0:
+        window_size_left = -1
+    if window_size_right < 0:
+        window_size_right = -1
+    return window_size_left, window_size_right
+
+
 @_torch_custom_op_wrapper(
     "flash_attn_npu_arch35_v3_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
@@ -280,6 +299,8 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
 
+    window_size_left, window_size_right = _normalize_window_size(window_size, causal)
+
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,
@@ -304,8 +325,8 @@ def flash_attn_with_kvcache(
         q_descale, k_descale, v_descale,
         softmax_scale,
         causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
         attention_chunk=attention_chunk,
         softcap=softcap,
         rotary_interleaved=rotary_interleaved,
@@ -362,7 +383,7 @@ def flash_attn_func(
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). Not supported on Ascend 950, must be (-1, -1).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         return_attn_probs: bool. Whether to return the attention log-sum-exp values.
             If True, returns (out, softmax_lse).
 
@@ -380,6 +401,8 @@ def flash_attn_func(
 
     batch_size = q.shape[0]
     seqlen_k = k.shape[1]
+
+    window_size_left, window_size_right = _normalize_window_size(window_size, causal)
 
     # 950 backend requires seqused_k (per-batch KV seqlen).
     # For flash_attn_func, all batches have the same KV length.
@@ -409,8 +432,8 @@ def flash_attn_func(
         q_descale, k_descale, v_descale,
         softmax_scale,
         causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
         attention_chunk=attention_chunk,
         softcap=softcap,
         rotary_interleaved=True,
@@ -484,6 +507,8 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
+    window_size_left, window_size_right = _normalize_window_size(window_size, causal)
+
     # Derive per-batch sequence lengths from cumulative cu_seqlens if not provided.
     # cu_seqlens format: [0, s1, s1+s2, s1+s2+s3, ...]
     # Per-batch: [s1, s2, s3, ...]
@@ -519,8 +544,8 @@ def flash_attn_varlen_func(
         q_descale, k_descale, v_descale,
         softmax_scale,
         causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
         attention_chunk=attention_chunk,
         softcap=softcap,
         rotary_interleaved=True,

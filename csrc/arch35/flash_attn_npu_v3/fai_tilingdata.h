@@ -64,8 +64,8 @@ struct FAInferTilingData {
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int32_t sparseMode = 0;
-    uint32_t globalWindowSize = 4;
-    uint32_t localWindowSize = 0;
+    int32_t globalWindowSize = 0;
+    int32_t localWindowSize = 0;
     std::string cacheLayout = "nd";
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
@@ -145,8 +145,8 @@ struct FAInferTilingData {
     void set_padding2(uint64_t value) { padding2 = value; }
     void set_padding3(uint32_t value) { padding3 = value; }
     void set_sparseMode(int32_t value) { sparseMode = value; }
-    void set_globalWindowSize(uint32_t value) { globalWindowSize = value; }
-    void set_localWindowSize(uint32_t value) { localWindowSize = value; }
+    void set_globalWindowSize(int32_t value) { globalWindowSize = value; }
+    void set_localWindowSize(int32_t value) { localWindowSize = value; }
     void set_cacheLayout(std::string value) { cacheLayout = value; }
     void set_preToken(int64_t value) { preToken = value; }
     void set_nextToken(int64_t value) { nextToken = value; }

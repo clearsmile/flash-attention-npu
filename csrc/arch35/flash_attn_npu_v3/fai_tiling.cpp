@@ -31,7 +31,8 @@ namespace optiling{
 
     enum class MaskType : uint32_t {
         NO_MASK = 0,
-        MASK_SPEC = 1
+        MASK_SPEC = 1,
+        MASK_SWA = 4
     };
 
     enum class DataType : uint32_t {
@@ -55,6 +56,8 @@ namespace optiling{
         int64_t nextToken = 0;
         int32_t sparseMode = 0;
         std::string cacheLayout = "nd";
+        int32_t globalWindowSize = 0;
+        int32_t localWindowSize = 0;
         uint32_t maxNumBlocksPerBatch = 0;
         const int32_t *qSeqlenList{nullptr};
         const int32_t *kvSeqlenList{nullptr};
@@ -155,7 +158,9 @@ namespace optiling{
         faTilingData.set_cacheLayout(faInfo_.cacheLayout);
         faTilingData.set_preToken(static_cast<int64_t>(faInfo_.preToken));
         faTilingData.set_nextToken(static_cast<int64_t>(faInfo_.nextToken));
-        
+        faTilingData.set_globalWindowSize(faInfo_.globalWindowSize);
+        faTilingData.set_localWindowSize(faInfo_.localWindowSize);
+
         auto qkL1TileM_ = 128;
         auto qkL1TileKLeft_ = 192;
         auto qL1BufNum_ = 1;
@@ -217,6 +222,9 @@ namespace optiling{
         }
         if (faInfo_.maskType == MaskType::MASK_SPEC) {
             tilingKey += static_cast<uint64_t>(COMP_CAUSAL_MASK_KEY);
+        }
+        if (faInfo_.maskType == MaskType::MASK_SWA) {
+            tilingKey += static_cast<uint64_t>(COMP_SWA_MASK_KEY);
         }
         if (faInfo_.layout == "TND") {
             tilingKey += static_cast<uint64_t>(LAYOUTQ_TND_KEY);

@@ -9,7 +9,7 @@
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
  *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
- *   ❌ SWA / window_size != (-1, -1)
+ *   ✅ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
  *   ❌ pack_gqa, scheduler_metadata, leftpad_k
  */
@@ -104,8 +104,6 @@ mha_fwd(at::Tensor q,
                 && !v_descale_.has_value(),
                 "950 backend (v3) does not support FP8 descales");
     TORCH_CHECK(softcap == 0.0f, "950 backend (v3) does not support softcap");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "950 backend (v3) does not support SWA");
     TORCH_CHECK(attention_chunk == 0,
                 "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(!scheduler_metadata_.has_value(),
@@ -217,6 +215,42 @@ mha_fwd(at::Tensor q,
     at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
     // ============================================================
+    // 5b. Window size 标准化（对齐 arch22 flash_api.cpp:298-313）
+    //     causal 与 local 互斥；标准化后重新推导 is_causal / is_local。
+    //     TND 多 batch 场景必须按单序列最大 kv seqlen 归一化，
+    //     不能使用 k.size(0)（总 token 数）。
+    // ============================================================
+    if (is_causal) {
+        window_size_right = 0;
+    }
+
+    int64_t max_kv_seqlen = 0;
+    {
+        const int32_t* seqlens_data = seqlens_k_cpu.data_ptr<int32_t>();
+        for (int64_t i = 0; i < seqlens_k_cpu.numel(); ++i) {
+            if (seqlens_data[i] > max_kv_seqlen) {
+                max_kv_seqlen = seqlens_data[i];
+            }
+        }
+    }
+    if (window_size_left < 0) {
+        window_size_left = -1;
+    }
+    if (window_size_right < 0) {
+        window_size_right = -1;
+    }
+    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+        window_size_left = -1;
+    }
+    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+        window_size_right = -1;
+    }
+
+    // 重推导 is_causal / is_local（对齐 arch22 flash_api.cpp:312-313）
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    const bool is_local = (window_size_left >= 0 || window_size_right > 0) && !is_causal;
+
+    // ============================================================
     // 7. Build FAInferContext + run host-side tiling
     // ============================================================
     SeqlenScratch scratch;
@@ -232,7 +266,9 @@ mha_fwd(at::Tensor q,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
         /* lse_flag= */ true,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+        /* layout_str= */ is_varlen_q ? "TND" : "BSND",
+        /* window_size_left= */ window_size_left,
+        /* window_size_right= */ window_size_right);
 
     FAInferTilingData tilingData{};
     {
@@ -284,7 +320,16 @@ mha_fwd(at::Tensor q,
                                            : CacheMode::normalCache;
     const PageShape pageShape = paged_KV ? PageShape::BnBsND
                                            : PageShape::normalShape;
-    const uint32_t maskTypeKey = is_causal ? 1u : 0u;
+    // maskTypeKey: 0=NO_MASK, 1=MASK_CAUSAL, 4=MASK_SWA
+    // 对齐 arch22 flash_api.cpp:314-320
+    uint32_t maskTypeKey;
+    if (is_local) {
+        maskTypeKey = 4u;  // MASK_SWA
+    } else if (is_causal) {
+        maskTypeKey = 1u;  // MASK_CAUSAL
+    } else {
+        maskTypeKey = 0u;  // NO_MASK
+    }
     const uint32_t innerPrec = 0u; // FP32 accum
     const std::string dataType = is_bf16 ? "bf16" : "half";
     const std::string cacheLayout = "nd"; // nd only
@@ -323,15 +368,35 @@ mha_fwd(at::Tensor q,
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     at::Tensor mask_cpu_tensor;
-    if (is_causal) {
+    // causal 和 SWA 共用 triu(2048, 1) 矩阵 — 对齐 arch22 flash_api.cpp:412-416
+    // kernel 通过 preMask/nextMask 双边界逻辑 + triu 反转（OperatePreMaskUb）
+    // 从同一份 triu 矩阵组合出带状效果，无需 Host 端 band mask
+    if (maskTypeKey == 1u || maskTypeKey == 4u) {
         mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+        if (maskTypeKey == 1u) {
+            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+        } else {
+            if (innerPrec == 0u) {
+                mask_cpu_tensor = at::zeros_like(mask_cpu_tensor);
+                if (window_size_left >= 0) {
+                    mask_cpu_tensor = mask_cpu_tensor +
+                        at::tril(at::ones_like(mask_cpu_tensor), -window_size_left - 1);
+                }
+                if (window_size_right >= 0) {
+                    mask_cpu_tensor = mask_cpu_tensor +
+                        at::triu(at::ones_like(mask_cpu_tensor), window_size_right + 1);
+                }
+            } else {
+                mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+            }
+        }
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
+    // DN (Dual-Negative) 仅在无 mask 场景启用 — SWA 也禁用
     const bool enableDN =
-        (!is_causal) && (head_size_q <= 128) && (head_size_v <= 128) && (innerPrec == 0u);
+        (maskTypeKey == 0u) && (head_size_q <= 128) && (head_size_v <= 128) && (innerPrec == 0u);
 
     const aclError err = fai_host::LaunchFAI(
         kernelKey, enableDN,

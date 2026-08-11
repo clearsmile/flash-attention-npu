@@ -111,7 +111,9 @@ inline void fill_inference_context(
     int  head_size_v,
     float softmax_scale,
     bool lse_flag,
-    const std::string& layout_str)              // "TND" | "BSND"
+    const std::string& layout_str,              // "TND" | "BSND"
+    int64_t window_size_left,                   // SWA: left window extent (-1 = unbounded)
+    int64_t window_size_right)                  // SWA: right window extent (-1 = unbounded)
 {
     const bool is_tnd = (layout_str == "TND");
 
@@ -180,8 +182,21 @@ inline void fill_inference_context(
     ctx.kvSeqlenList = scratch.kv.data();
 
     ctx.scaleValue = softmax_scale;
-    ctx.maskType = is_causal ? optiling::MaskType::MASK_SPEC
-                                    : optiling::MaskType::NO_MASK;
+
+    // SWA (Sliding Window Attention) window size — 对齐 arch22 flash_api.cpp:312-313
+    // 注意 right 用 > 0（严格大于）：causal 时 mha_fwd.cpp 已强制 window_size_right=0，
+    // 若用 >= 0 会把纯 causal 误判为 SWA（tiling key 与 kernel key 不匹配）。
+    // 与测试 golden 的 is_local_golden 计算保持一致（tests/test_flash_attn_npu_v3.py）。
+    const bool is_local = (window_size_left >= 0 || window_size_right > 0);
+    if (is_local) {
+        ctx.maskType = optiling::MaskType::MASK_SWA;
+        // 直接透传原始值，-1 sentinel 转换为 INT32_MAX（对齐 arch22 tilingdata.h:113-114）
+        ctx.globalWindowSize = (window_size_left == -1) ? INT32_MAX : static_cast<int32_t>(window_size_left);
+        ctx.localWindowSize  = (window_size_right == -1) ? INT32_MAX : static_cast<int32_t>(window_size_right);
+    } else {
+        ctx.maskType = is_causal ? optiling::MaskType::MASK_SPEC
+                                 : optiling::MaskType::NO_MASK;
+    }
     ctx.dataType = is_bf16 ? optiling::DataType::BF16
                                   : optiling::DataType::FP16;
     ctx.pagedCacheFlag = paged_KV;
@@ -198,8 +213,6 @@ inline void fill_inference_context(
     ctx.preToken = 0;
     ctx.nextToken = 0;
     ctx.sparseMode = 0;
-    // ctx.globalWindowSize   = 4;  // SWA defaults; kernel reads them only when SWA is on
-    // ctx.localWindowSize    = 0;
     ctx.numTokens = 0;  // not used by DoTiling on this path
 }
 

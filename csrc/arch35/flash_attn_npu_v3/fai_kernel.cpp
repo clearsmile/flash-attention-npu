@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -6,8 +6,8 @@
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/arch.hpp"
@@ -19,8 +19,13 @@
 
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
+#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
+#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP
 #include "catlass/epilogue/block/block_epilogue.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
+
+#include "online_softmax.hpp"
+#include "rescale_o.hpp"
 
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
@@ -126,6 +131,8 @@ public:
         kL1BufNum_ = faiTilingData->kL1BufNum;
         vL1BufNum_ = faiTilingData->vL1BufNum;
         pL1BufNum_ = faiTilingData->pL1BufNum;
+        globalWindowSize_ = faiTilingData->globalWindowSize;   // SWA left window
+        localWindowSize_  = faiTilingData->localWindowSize;    // SWA right window
 
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
@@ -283,13 +290,131 @@ public:
             uint32_t kvSTileSizeAct = kvBaseTile_;
 
             uint32_t noSkipKvS = kvSeqlen;
+            isEmptyWindow_ = false;   // 每个 Q tile 重置空窗口标记
+            // SWA (Sliding Window Attention) 窗口边界变量 — 对齐 arch22 mha_fwd_kvcache.cpp:560-601
+            uint32_t kvSStartIdx = 0;
+            bool notPreMask = true;
+            bool notNextMask = true;
+            int32_t windowSizeLeftStartLen = 0;
+            int32_t windowSizeLeftEndLen = 0;
+            int32_t windowSizeRightStartLen = 0;
+            int32_t windowSizeRightEndLen = 0;
+            int32_t delStartRow = 0;
+            int32_t delEndRow = static_cast<int32_t>(qSeqlen);
+            int32_t leftPoint = 0;
+            int32_t rightPoint = 0;
+            int32_t swaMaskRowOffset = 0;
+
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                 uint32_t diffS = kvSeqlen - qSeqlen;
                 noSkipKvS = (qSTileIdx + 1U) * qBaseTile_ + diffS;
                 noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, noSkipKvS);
-            } 
+            } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                int32_t winL = static_cast<int32_t>(globalWindowSize_);
+                int32_t winR = static_cast<int32_t>(localWindowSize_);
+                // 对齐 arch22 mha_fwd_kvcache.cpp:572,583: Q/K 底部对齐偏移量。
+                // kvSeqlen 可能大于 qSeqlen（此时 diffS > 0，Q[i] 对齐 KV[i+diffS]），
+                // 也可能小于（diffS < 0）。**不能钳制为 0**，否则窗口在 KV 空间错位。
+                int32_t diffS = static_cast<int32_t>(kvSeqlen) - static_cast<int32_t>(qSeqlen);
+                swaMaskRowOffset = static_cast<int32_t>(qSOffset) + diffS;
+
+                // 左侧窗口边界：跳过 window_left 范围外的 KV blocks
+                // winL == INT32_MAX: sentinel，无左边界约束（由 tiling_from_tensors.hpp 将 -1 转换而来）
+                if (winL == INT32_MAX) {
+                    kvSStartIdx = 0;
+                } else if (winL < 0 && winL * (-1) >= static_cast<int32_t>(qSeqlen)) {
+                    kvSStartIdx = static_cast<uint32_t>(kvSeqlen) / kvBaseTile_ + 1;
+                } else {
+                    leftPoint = diffS - winL;
+                    windowSizeLeftStartLen = static_cast<int32_t>(qSTileIdx * qBaseTile_) + leftPoint;
+                    windowSizeLeftEndLen = windowSizeLeftStartLen + static_cast<int32_t>(rowNum);
+                    kvSStartIdx = static_cast<uint32_t>(
+                        AscendC::Std::max(0, windowSizeLeftStartLen) / static_cast<int32_t>(kvBaseTile_));
+                    notPreMask = false;
+                }
+
+                // 右侧窗口截断
+                if (winR == INT32_MAX) {
+                    noSkipKvS = kvSeqlen;
+                } else if (winR < 0 && winR * (-1) >= static_cast<int32_t>(kvSeqlen)) {
+                    noSkipKvS = 0;
+                } else {
+                    rightPoint = diffS + winR;
+                    windowSizeRightStartLen = static_cast<int32_t>(qSTileIdx * qBaseTile_) + rightPoint;
+                    windowSizeRightEndLen = windowSizeRightStartLen + static_cast<int32_t>(rowNum);
+                    // 保护 RoundUp 免受负参数影响: 当 windowSizeRightEndLen < 0 时，
+                    // 整个右窗口在当前 KV tile 之前，截断为 0
+                    int32_t safeRightEnd = AscendC::Std::max(0, windowSizeRightEndLen);
+                    noSkipKvS = static_cast<uint32_t>(
+                        AscendC::Std::min(static_cast<int32_t>(kvSeqlen),
+                            RoundUp(safeRightEnd, static_cast<int32_t>(kvBaseTile_))));
+                    // 右边界完全落在 tile 0 之前时，保持全量循环，
+                    // 由 delEndRow 统一清零无效行（对齐 arch22 mha_fwd_kvcache.cpp:587）
+                    if (noSkipKvS == 0) {
+                        noSkipKvS = kvSeqlen;
+                    }
+                    notNextMask = false;
+                }
+
+                // 整 Q tile 内无有效窗口的行范围（对齐 arch22 mha_fwd_kvcache.cpp:594-598）
+                if (winL != INT32_MAX && windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen)) {
+                    delStartRow = static_cast<int32_t>(kvSeqlen) - leftPoint;
+                }
+                if (winR != INT32_MAX && windowSizeRightStartLen < 0) {
+                    delEndRow = -rightPoint;
+                }
+            }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
+
+            // 空窗口早退（对齐 arch22 mha_fwd_kvcache.cpp:617-624）：
+            // kvSLoopNum == 0 或 kvSStartIdx >= kvSLoopNum 时，当前 q tile 没有任何
+            // 有效 KV，将 gO 对应行清零；LSE 保持 host 预置 +inf（950 内核不写 LSE）。
+            //
+            // 注意：不能直接用 continue 跳过 KV 循环，也不能让循环空转（kvSLoopNum=0）：
+            // blockMmadQK/blockMmadPV 内部通过 SetCrossCoreSync<4,...> 为两个 AIV 设置
+            // 跨核 flag（ID + V0_V1_FLAG_ID_OFFSET=16 → flag 16/17/21/22），这些 flag 在
+            // 循环体执行时才被 Set，而 ReleaseSyncFlags<4,4,4>() 等待它们。空转循环不
+            // 执行 matmul → 这些 flag 从未被 Set → Release 的 CrossCoreWaitFlag 死锁
+            // → aicore timeout（err=507014，日志 data_type28）。
+            //
+            // 修复：将 kvSLoopNum 置 1（虚拟 KV tile），让 AIC/AIV 流水正常执行一次
+            // QK→softmax→PV，从而 Set 全部跨核 flag。gO 已清零，虚拟 tile 的 PV 结果
+            // 通过 isEmptyWindow_ 标志在 epilogueRescaleO 处被丢弃（不写入 gO）。
+            //
+            // 注意：虚拟 tile 必须**始终从 tile 0 开始**（kvSStartIdx=0），不能保留
+            // 原 kvSStartIdx：虚拟 tile 只执行 1 次 QK/PV，若从非零 tile 开始，则
+            // 本核只会 Set 奇/偶 tile 对应的 flag 子集（如 tile 7 → 1/17 与 6/22，
+            // 不 Set 0/16 与 5/21），而 ReleaseSyncFlags<4,4,4>() 无条件等待全部
+            // 四个 V1 flag（16/17/21/22）。当本核是唯一不 Set 某个 flag 的核时，
+            // CrossCoreWaitFlag 永久等待 → aicore timeout（err=507015，日志
+            // data_type22: win=(-128,864)，Q tile 7 空窗口被修复为从 tile 7 开始）。
+            //
+            // 从 tile 0 开始（kvSLoopNum=1, kvSStartIdx=0）时，虚拟 tile 的 flag
+            // 模式为 qkReadyFlag=0/16、softmaxReadyFlag=2/18、pvReadyFlag=5/21，
+            // 与正常 Q tile 0 完全相同 —— 本核自设 Release 所需的全部 V1 flag，
+            // 不依赖其他核补设，与 data_type28（已验证不再崩溃）路径一致。
+            if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                if (kvSLoopNum == 0 || kvSStartIdx >= kvSLoopNum) {
+                    isEmptyWindow_ = true;
+#ifdef __DAV_VEC__
+                    auto zeroUb = resource.ubBuf.template GetBufferByByte<ElementO>(0);
+                    AscendC::Duplicate(zeroUb, static_cast<ElementO>(0), embedVRound);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    for (uint32_t row = 0; row < rowNum; ++row) {
+                        AscendC::DataCopy(
+                            gO[gmOffsetO + row * strideO], zeroUb,
+                            AscendC::DataCopyParams(1, embedV_ / 16, 0, 0));
+                    }
+                    AscendC::PipeBarrier<PIPE_MTE3>();
+#endif
+                    // 统一虚拟 tile：kvSLoopNum=1, kvSStartIdx=0, noSkipKvS=128
+                    // （覆盖 kvSLoopNum==0 与 kvSStartIdx>=kvSLoopNum 两种情况）
+                    kvSLoopNum = 1;
+                    kvSStartIdx = 0;
+                    noSkipKvS = kvBaseTile_;
+                }
+            }
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
@@ -323,7 +448,7 @@ public:
             auto gmOLayoutTla = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, oShapeCol);
             auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO], gmOLayoutTla, Arch::PositionGM{});
 #endif
-            for (uint32_t kvSTileIdx = 0; kvSTileIdx < kvSLoopNum + PRE_LAUNCH; kvSTileIdx++) {
+            for (uint32_t kvSTileIdx = kvSStartIdx; kvSTileIdx < kvSLoopNum + PRE_LAUNCH; kvSTileIdx++) {
                 if (kvSTileIdx < kvSLoopNum) {
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
@@ -341,9 +466,9 @@ public:
                     Arch::CrossCoreFlag qkReadyFlag(qkReadyFlagId);
 #ifdef __DAV_CUBE__
                     uint64_t prefixSumL0AStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopNum, true);
+                        kvSTileIdx - kvSStartIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopNum, true);
                     uint64_t prefixSumL0BStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopNum, true);
+                        kvSTileIdx - kvSStartIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopNum, true);
                     if constexpr (enableDN) {
                         blockMmadQK(
                             gmKTensorTlaDN, ubSTensorTlaDN,
@@ -414,6 +539,79 @@ public:
                                 qkReadyFlag,
                                 softmaxReadyFlag);
                         }
+                    } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                        // SWA: preMask/nextMask 双边界 triu 复用 — 对齐 arch22 mha_fwd_kvcache.cpp:762-816
+                        // 判定当前 KV tile 是否与窗口左/右边界相交
+                        uint32_t kvSStart = kvSTileIdx * kvBaseTile_;
+                        uint32_t kvSEnd   = kvSStart + kvSTileSizeAct;
+
+                        bool doTriUPreMask = notPreMask ? false :
+                            (windowSizeLeftStartLen >= static_cast<int32_t>(kvSStart) &&
+                             windowSizeLeftStartLen <  static_cast<int32_t>(kvSEnd)) ||
+                            (windowSizeLeftEndLen   >  static_cast<int32_t>(kvSStart) &&
+                             windowSizeLeftEndLen   <= static_cast<int32_t>(kvSEnd)) ||
+                            (windowSizeLeftStartLen <= static_cast<int32_t>(kvSStart) &&
+                             windowSizeLeftEndLen   >= static_cast<int32_t>(kvSEnd));
+
+                        bool doTriUNextMask = notNextMask ? false :
+                            (windowSizeRightStartLen >= static_cast<int32_t>(kvSStart) &&
+                             windowSizeRightStartLen <  static_cast<int32_t>(kvSEnd)) ||
+                            (windowSizeRightEndLen   >  static_cast<int32_t>(kvSStart) &&
+                             windowSizeRightEndLen   <= static_cast<int32_t>(kvSEnd)) ||
+                            (windowSizeRightStartLen <= static_cast<int32_t>(kvSStart) &&
+                             windowSizeRightEndLen   >= static_cast<int32_t>(kvSEnd));
+
+                        if (doTriUPreMask || doTriUNextMask) {
+                            if constexpr (std::is_same_v<ElementS, float>) {
+                                epilogueOnlineSoftmax(
+                                    l1PTensorTla, gMask,
+                                    actualBlockShapeQK,
+                                    (kvSTileIdx == kvSStartIdx),
+                                    ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag,
+                                    swaMaskRowOffset,
+                                    static_cast<int32_t>(kvSStart));
+                            } else {
+                                auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
+                                auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
+                                if (doTriUNextMask && !doTriUPreMask) {
+                                    uint32_t triUp = static_cast<uint32_t>(
+                                        AscendC::Std::max(0, windowSizeRightStartLen));
+                                    uint32_t triDown = static_cast<uint32_t>(
+                                        AscendC::Std::max(0, windowSizeRightEndLen));
+                                    uint32_t kvSIdx = kvSTileIdx * kvBaseTile_;
+                                    uint32_t kvEIdx = kvSIdx + kvSTileSizeAct;
+                                    epilogueOnlineSoftmax(
+                                        l1PTensorTla, gmMaskTensorTla,
+                                        actualBlockShapeQK,
+                                        (kvSTileIdx == kvSStartIdx),
+                                        ubSBufId, l1PBufId,
+                                        qkReadyFlag, softmaxReadyFlag,
+                                        triUp, triDown, 0, 0,
+                                        kvSIdx, kvEIdx,
+                                        1);
+                                } else {
+                                    epilogueOnlineSoftmax(
+                                        l1PTensorTla, gmMaskTensorTla,
+                                        actualBlockShapeQK,
+                                        (kvSTileIdx == kvSStartIdx),
+                                        ubSBufId, l1PBufId,
+                                        qkReadyFlag, softmaxReadyFlag,
+                                        static_cast<int32_t>(kvSStart),
+                                        doTriUPreMask, doTriUNextMask,
+                                        windowSizeLeftStartLen, windowSizeLeftEndLen,
+                                        windowSizeRightStartLen, windowSizeRightEndLen);
+                                }
+                            }
+                        } else {
+                            // 窗口内部 tile: 完全不读 mask — 走快速路径 ⚡
+                            epilogueOnlineSoftmax(
+                                l1PTensorTla,
+                                actualBlockShapeQK,
+                                (kvSTileIdx == kvSStartIdx),
+                                ubSBufId, l1PBufId,
+                                qkReadyFlag, softmaxReadyFlag);
+                        }
                     } else {
                         if constexpr (enableDN) {
                             epilogueOnlineSoftmax(
@@ -437,7 +635,7 @@ public:
                     }
 #endif
                 }
-                if (kvSTileIdx >= PRE_LAUNCH) {
+                if (kvSTileIdx >= kvSStartIdx + PRE_LAUNCH) {
                     uint32_t kvSTileIdxNow = kvSTileIdx - PRE_LAUNCH;
                     if (kvSTileIdxNow == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdxNow * kvBaseTile_;
@@ -456,9 +654,9 @@ public:
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint64_t prefixSumL0AStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileIdxNow, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopNum, false);
+                        kvSTileIdxNow - kvSStartIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopNum, false);
                     uint64_t prefixSumL0BStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileIdxNow, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopNum, false);
+                        kvSTileIdxNow - kvSStartIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopNum, false);
                     blockMmadPV(
                         gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset],
                         actualBlockShapePV,
@@ -473,23 +671,54 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = kvSTileIdxNow % (PRE_LAUNCH + 1);
-                    if constexpr (enableDN) {
+                    if (isEmptyWindow_) {
+                        // 空窗口虚拟 tile：gO 已清零，丢弃 PV 结果。
+                        // 仅消费 pvReadyFlag（与 epilogueRescaleO 相同的 Wait/Set 配对），
+                        // 维持 AIC→AIV 流水同步，避免 flag 残留导致后续 Q tile 错乱。
+                        // 注意：.template 关键字必须存在，因为 WaitCrossCoreSync/
+                        // SetCrossCoreSync 是依赖名成员函数模板。
+                        epilogueRescaleO.template WaitCrossCoreSync<4, PIPE_V>(pvReadyFlag);
+                        epilogueRescaleO.template SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
+                    } else if constexpr (enableDN) {
                         epilogueRescaleO(
                             gmOTensorTla, actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
-                            (kvSTileIdxNow == 0),
+                            (kvSTileIdxNow == kvSStartIdx),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 1);
                     } else {
                         epilogueRescaleO(
                             gmOTensorTla, actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
-                            (kvSTileIdxNow == 0),
+                            (kvSTileIdxNow == kvSStartIdx),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 0);
                     }
 #endif
                 }
+            }
+
+            if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+#ifdef __DAV_VEC__
+                // 窗口外行清零：整 Q tile 空窗口已在上方清零，这里补齐 tile 内
+                // 部分行无有效 KV（例如 win=(64,0) 的前 64 行）导致的 NaN/脏输出。
+                int32_t rowStartLocal = AscendC::Std::max(static_cast<int32_t>(0),
+                    delStartRow - static_cast<int32_t>(qSOffset));
+                int32_t rowEndLocal = AscendC::Std::min(static_cast<int32_t>(rowNum),
+                    delEndRow - static_cast<int32_t>(qSOffset));
+                if ((delStartRow > 0 || delEndRow < static_cast<int32_t>(qSeqlen)) &&
+                    rowStartLocal < rowEndLocal) {
+                    auto zeroUb = resource.ubBuf.template GetBufferByByte<ElementO>(0);
+                    AscendC::Duplicate(zeroUb, static_cast<ElementO>(0), embedVRound);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    for (int32_t row = rowStartLocal; row < rowEndLocal; ++row) {
+                        AscendC::DataCopy(
+                            gO[gmOffsetO + row * strideO], zeroUb,
+                            AscendC::DataCopyParams(1, embedV_ / 16, 0, 0));
+                    }
+                    AscendC::PipeBarrier<PIPE_MTE3>();
+                }
+#endif
             }
         }
         ReleaseSyncFlags<4, 4, 4>();
@@ -625,9 +854,18 @@ public:
                 KvSTileIdx * singleqkL0Stages :
                 KvSTileIdx * singleqkL0Stages + (KvSTileIdx - PRE_LAUNCH) * singlepvL0Stages;
         } else {
-            prefixSumStages = (KvSTileIdx < kvSLoopNum - PRE_LAUNCH) ?
-                (KvSTileIdx + 1 + PRE_LAUNCH) * singleqkL0Stages + KvSTileIdx * singlepvL0Stages:
-                kvSLoopNum * singleqkL0Stages + KvSTileIdx * singlepvL0Stages;
+            // 修复 uint32_t 下溢：当 kvSLoopNum <= PRE_LAUNCH 时，
+            // kvSLoopNum - PRE_LAUNCH 作为无符号数下溢为 0xFFFFFFFF，
+            // 导致条件 KvSTileIdx < 0xFFFFFFFF 恒为 true，取错分支。
+            // 当 kvSLoopNum <= PRE_LAUNCH 时，所有 QK tile 均已完成，
+            // 直接使用 kvSLoopNum * sqk + KvSTileIdx * spv。
+            if (kvSLoopNum > PRE_LAUNCH) {
+                prefixSumStages = (KvSTileIdx < kvSLoopNum - PRE_LAUNCH) ?
+                    (KvSTileIdx + 1 + PRE_LAUNCH) * singleqkL0Stages + KvSTileIdx * singlepvL0Stages :
+                    kvSLoopNum * singleqkL0Stages + KvSTileIdx * singlepvL0Stages;
+            } else {
+                prefixSumStages = kvSLoopNum * singleqkL0Stages + KvSTileIdx * singlepvL0Stages;
+            }
         }
         return prefixSumStages;
     }
@@ -666,6 +904,10 @@ private:
     uint32_t kL1BufNum_;
     uint32_t vL1BufNum_;
     uint32_t pL1BufNum_;
+
+    int32_t globalWindowSize_;    // SWA: left window extent (int32 支持负数语义)
+    int32_t localWindowSize_;     // SWA: right window extent
+    bool isEmptyWindow_ = false;  // SWA 空窗口标记：丢弃虚拟 KV tile 的 PV 结果，保持 gO 清零
 
     uint32_t qkL0ATotalStages_;
     uint32_t qkL0BTotalStages_;
