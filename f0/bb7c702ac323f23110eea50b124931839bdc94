@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "f0bb7c702ac323f23110eea50b124931839bdc94",
+  "prompts": {},
+  "humans": {
+    "h_cf5f478f136ed7": {
+      "author": "doufloat <baijinxiang@huawei.com>"
+    }
+  }
+}
