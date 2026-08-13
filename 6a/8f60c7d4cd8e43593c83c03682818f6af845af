@@ -1,0 +1,18 @@
+flash_attn_npu_3/flash_attn_npu_interface_950.py
+  h_cf5f478f136ed7 442-656
+flash_attn_npu_3/__init__.py
+  h_cf5f478f136ed7 26-28,30
+tests/test_flash_attn_npu_v3.py
+  h_cf5f478f136ed7 8,573-574,666-667
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "6a8f60c7d4cd8e43593c83c03682818f6af845af",
+  "prompts": {},
+  "humans": {
+    "h_cf5f478f136ed7": {
+      "author": "doufloat <baijinxiang@huawei.com>"
+    }
+  }
+}
