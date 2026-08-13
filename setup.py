@@ -275,8 +275,8 @@ class BishengBuildExt(build_ext):
             os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
 
     def _build_aicpu_metadata(self, ext_fullpath, ext_name):
-        """Compile fa_metadata.aicpu (host AICPU object) for the ascend910
-        extensions that carry the scheduler-metadata feature (v2 and v3). This
+        """Compile fa_metadata.aicpu (host AICPU object) for the extensions
+        that carry the scheduler-metadata feature (910 v2/v3 and 950 v3). This
         is a separate `bisheng -x aicpu` invocation (host CPU code
         cross-compiled with hcc, not ASC device code); the resulting object is
         linked into the extension alongside the ASC device objects. Returns the
@@ -285,6 +285,7 @@ class BishengBuildExt(build_ext):
         aicpu_src_dirs = {
             "flash_attn_npu.flash_attn_npu": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu"),
             "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
+            "flash_attn_npu_3_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_3"),
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:
@@ -292,7 +293,10 @@ class BishengBuildExt(build_ext):
         aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
         if not os.path.exists(aicpu_src):
             return None
-        aicpu_obj = os.path.join(os.path.dirname(ext_fullpath), "fa_metadata.o")
+        aicpu_obj = os.path.join(
+            os.path.dirname(ext_fullpath),
+            "fa_metadata_950.o" if ext_name == "flash_attn_npu_3_950" else "fa_metadata.o",
+        )
         # Incremental: aicpu is a host-code cross-compile (hcc) with no depfile,
         # so mtime-on-source only. Skip if the object is already up-to-date.
         if not self._force_rebuild() and os.path.exists(aicpu_obj) and \
@@ -390,7 +394,7 @@ class BishengBuildExt(build_ext):
                 ext_name, obj = fut.result()
                 objs_by_ext[ext_name].append(obj)
 
-        # AICPU metadata object for the ascend910 extensions carrying the
+        # AICPU metadata object for the extensions carrying the
         # scheduler-metadata feature: compiled separately (host code,
         # `bisheng -x aicpu`) and appended to each extension's link set. Built
         # after the parallel ASC compiles, before linking.

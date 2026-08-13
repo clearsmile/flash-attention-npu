@@ -11,7 +11,7 @@
  *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
  *   ❌ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
- *   ❌ pack_gqa, scheduler_metadata, leftpad_k
+ *   ❌ pack_gqa, leftpad_k
  */
 
 #include <cmath>
@@ -25,7 +25,9 @@
 #include "fai_host_api.hpp"
 #include "fai_tiling.cpp"
 #include "fai_tilingdata.h"
+#include "fa_metadata_args.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
 
@@ -112,8 +114,6 @@ mha_fwd(at::Tensor q,
                 "950 backend (v3) does not support SWA");
     TORCH_CHECK(attention_chunk == 0,
                 "950 backend (v3) does not support attention_chunk");
-    TORCH_CHECK(!scheduler_metadata_.has_value(),
-                "950 backend (v3) does not consume scheduler_metadata");
     TORCH_CHECK(num_splits == 0 || num_splits == 1,
                 "950 backend (v3) only supports num_splits=0 or 1");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(),
@@ -197,7 +197,9 @@ mha_fwd(at::Tensor q,
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
-    const int num_heads_k = static_cast<int>((is_varlen_q && !paged_KV) ? k.size(1) : k.size(2));
+    // k is 3D TND for flash_attn_varlen_func, but 4D
+    // (batch/num_blocks, seqlen/block, kv_heads, head) for flash_attn_with_kvcache.
+    const int num_heads_k = static_cast<int>(k.dim() == 3 ? k.size(1) : k.size(2));
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -244,51 +246,88 @@ mha_fwd(at::Tensor q,
     }
 
     // ============================================================
-    // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
-    //    FAInferContext consumes int32 lists, so we widen on host.
+    // 6/7. Tiling source: precomputed AICPU metadata or host tiling
     // ============================================================
-    at::Tensor cu_seqlen_q_cpu;
-    if (is_varlen_q) {
-        cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
-    }
-    at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
-
-    // ============================================================
-    // 7. Build FAInferContext + run host-side tiling
-    // ============================================================
+    uint8_t *tilingDevice = nullptr;
+    uint8_t *maskDevice = nullptr;
+    uint8_t *metaBase = nullptr;
+    uint64_t workSpaceSize = 0;
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
-    fill_inference_context(
-        ctx, scratch,
-        q, k, v,
-        is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
-        &seqlens_k_cpu,
-        paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
-        is_causal, is_varlen_q, is_bf16,
-        batch_size, seqlen_q, num_heads, num_heads_k,
-        head_size_q, head_size_v,
-        softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        /* lse_flag= */ true,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+    at::Tensor tiling_dev;
+    at::Tensor mask_npu_tensor;
 
-    FAInferTilingData tilingData{};
-    {
-        optiling::FAInferTiling tiler(ctx);
-        tiler.SetCoreNum(blockDim);
-        tiler.DoTiling(tilingData);
-    }
+    if (scheduler_metadata_.has_value()) {
+        auto schedMd = scheduler_metadata_.value();
+        TORCH_CHECK(schedMd.dtype() == at::kByte,
+                    "scheduler_metadata must be a byte tensor");
+        TORCH_CHECK(schedMd.is_contiguous(),
+                    "scheduler_metadata must be contiguous");
+        TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1,
+                    "scheduler_metadata must be an NPU tensor");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >=
+                        fa_metadata::MetadataBytesWithKv(is_causal, batch_size),
+                    "scheduler_metadata buffer is too small for this call's causal flag");
+        metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
+        tilingDevice = metaBase + fa_metadata::TilingOffset(is_causal);
+        maskDevice = is_causal ? metaBase : nullptr;
+        workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+        if (workSpaceSize < fa_metadata::WS_FLOOR) {
+            workSpaceSize = fa_metadata::WS_FLOOR;
+        }
+    } else {
+        at::Tensor cu_seqlen_q_cpu;
+        if (is_varlen_q) {
+            cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
+        }
+        at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
-    // The 950 chunk-prefill driver overrides workSpaceSize to 128 MiB
-    constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4;  // 128 MiB
-    if (tilingData.workSpaceSize < WS_FLOOR) {
-        tilingData.workSpaceSize = WS_FLOOR;
+        fill_inference_context(
+            ctx, scratch,
+            q, k, v,
+            is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+            &seqlens_k_cpu,
+            paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
+            is_causal, is_varlen_q, is_bf16,
+            batch_size, seqlen_q, num_heads, num_heads_k,
+            head_size_q, head_size_v,
+            softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
+            /* lse_flag= */ true,
+            /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+
+        FAInferTilingData tilingData{};
+        {
+            optiling::FAInferTiling tiler(ctx);
+            tiler.SetCoreNum(blockDim);
+            tiler.DoTiling(tilingData);
+        }
+        if (tilingData.workSpaceSize < fa_metadata::WS_FLOOR) {
+            tilingData.workSpaceSize = fa_metadata::WS_FLOOR;
+        }
+        workSpaceSize = tilingData.workSpaceSize;
+
+        at::Tensor tiling_cpu = at::empty(
+            {static_cast<int64_t>(sizeof(FAInferTilingData))},
+            at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData,
+                    sizeof(FAInferTilingData));
+        tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
+        tilingDevice = static_cast<uint8_t *>(tiling_dev.data_ptr());
+
+        if (is_causal) {
+            at::Tensor mask_cpu_tensor =
+                at::triu(at::ones({2048, 2048},
+                                  at::device(c10::kCPU).dtype(at::kByte)), 1);
+            mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            maskDevice = static_cast<uint8_t *>(mask_npu_tensor.data_ptr());
+        }
     }
 
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
     auto workspace = at::empty(
-        {static_cast<int64_t>(tilingData.workSpaceSize)},
+        {static_cast<int64_t>(workSpaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
 
     at::Tensor softmaxlse;
@@ -301,17 +340,6 @@ mha_fwd(at::Tensor q,
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
-
-    // ============================================================
-    // 9. Tiling host→device (CPU byte tensor + .to(kPrivateUse1) —
-    //    same idiom
-    // ============================================================
-    at::Tensor tiling_cpu = at::empty(
-        {static_cast<int64_t>(sizeof(FAInferTilingData))},
-        at::device(c10::kCPU).dtype(at::kByte));
-    std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData,
-                sizeof(FAInferTilingData));
-    at::Tensor tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
 
     // ============================================================
     // 10. Build kernelKey + launch via fai_host::LaunchFAI
@@ -337,46 +365,54 @@ mha_fwd(at::Tensor q,
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
     auto lseDev = static_cast<uint8_t*>(softmaxlse.data_ptr());
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
-    auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
+    auto tilDev = tilingDevice;
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
     at::Tensor q_seq_i64 = is_varlen_q
         ? cu_seqlens_q
         : at::empty({batch_size}, i64_npu);
     at::Tensor kv_seq_i64;
+    uint8_t *kvSeqDev = nullptr;
     if (is_varlen_kv) {
         kv_seq_i64 = cu_seqlens_k;
+        kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
     } else if (is_varlen_q && !paged_KV) {
-        kv_seq_i64 =
-        at::from_blob(const_cast<int32_t*>(ctx.kvSeqlenList), {batch_size + 1}, at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
+        if (scheduler_metadata_.has_value()) {
+            // AICPU precomputed the cumulative KV seqlen list in the metadata
+            // buffer, so the metadata path needs no host D2H or device cumsum.
+            kvSeqDev = metaBase + fa_metadata::KvSeqlenOffset(is_causal);
+        } else {
+            kv_seq_i64 = at::from_blob(
+                const_cast<int32_t *>(ctx.kvSeqlenList), {batch_size + 1},
+                at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
+            kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
+        }
     } else {
         kv_seq_i64 = seqlens_k;
+        kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
     }
     auto qSeqDev  = static_cast<uint8_t*>(q_seq_i64.data_ptr());
-    auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
     auto blockTableDev = paged_KV
         ? static_cast<uint8_t*>(page_table.data_ptr())
         : nullptr;
-    uint8_t* maskDev = nullptr;
-    at::Tensor mask_npu_tensor;
-    at::Tensor mask_cpu_tensor;
-    if (is_causal) {
-        mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
-        maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-    }
-
     const bool enableDN =
         (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
 
-    const aclError err = fai_host::LaunchFAI(
-        kernelKey, enableDN,
-        blockDim, aclStream,
-        qDev, kDev, vDev, maskDev, blockTableDev,
-        oDev, lseDev, qSeqDev, kvSeqDev,
-        wsDev, tilDev);
-    TORCH_CHECK(err == ACL_SUCCESS,
+    aclError launchErr = ACL_SUCCESS;
+    auto launch_fa_infer = [&]() -> int {
+        launchErr = fai_host::LaunchFAI(
+            kernelKey, enableDN,
+            blockDim, aclStream,
+            qDev, kDev, vDev, maskDevice, blockTableDev,
+            oDev, lseDev, qSeqDev, kvSeqDev,
+            wsDev, tilDev);
+        return 0;
+    };
+    // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can
+    // be captured by NPUGraph; an explicit aclrtSynchronizeStream here would
+    // fail graph capture with a device error.
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
+    TORCH_CHECK(launchErr == ACL_SUCCESS,
                 "950 backend (v3): unsupported kernelKey=", kernelKey,
                 " (no launcher registered for "
                 "dtype=", dataType, " cacheLayout=", cacheLayout,
@@ -384,10 +420,6 @@ mha_fwd(at::Tensor q,
                 " layout=", (fmt == Format::TND ? "TND" : "BSND"),
                 " cacheMode=", (paged_KV ? "paged" : "normal"),
                 ")");
-    const aclError sync_err = aclrtSynchronizeStream(aclStream);
-    TORCH_CHECK(sync_err == ACL_SUCCESS,
-                "950 backend (v3): aclrtSynchronizeStream failed after LaunchFAI, err=",
-                sync_err);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     at::Tensor empty_softmax_lse_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));

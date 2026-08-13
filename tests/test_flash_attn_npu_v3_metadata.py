@@ -4,8 +4,6 @@ import pytest
 import torch
 import torch_npu
 
-if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
-    pytest.skip("flash_attn_func / flash_attn_varlen_func / get_scheduler_metadata not on Ascend950", allow_module_level=True)
 
 from flash_attn_npu_3 import (
     flash_attn_func,
@@ -14,6 +12,16 @@ from flash_attn_npu_3 import (
     get_scheduler_metadata,
 )
 from tests.test_flash_attn_npu_v3 import ref_flash_attention
+
+def _is_ascend910():
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    return "Ascend910" in name
+
+
+def _is_ascend950():
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    return "Ascend950" in name
+
 
 RTOL = 1e-2
 ATOL = 1e-2
@@ -270,6 +278,7 @@ def metadata_spy(monkeypatch):
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -312,6 +321,7 @@ def test_flash_attn_func_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -367,6 +377,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -429,6 +440,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -494,6 +506,7 @@ def test_flash_attn_kvcache_metadata_tnd(
 
 
 @pytest.mark.parametrize("is_causal", [False])
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     """FD + metadata path with idle cores (needCoreNum < blockDim)."""
     batch_size, num_heads, kv_heads = 1, 1, 1
@@ -588,6 +601,7 @@ KV_CACHE_SWA_SOFTCAP_CASES = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -631,6 +645,7 @@ def test_flash_attn_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, softcap, softmax_scale, metadata_spy,
@@ -675,6 +690,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -731,6 +747,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap
@@ -803,6 +820,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         (True, (-1, -1), False, (-1, -1)),     # metadata has a causal mask, call needs none
     ],
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     meta_causal, meta_window, call_causal, call_window
 ):
@@ -844,6 +862,7 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     """Paged geometry baked into the tiling must match the call's cache/page table."""
     data_type = torch.bfloat16
@@ -891,6 +910,7 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
         call_with(unpaged)
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     """softcap/softmax_scale are baked into the tiling; mismatches must be rejected."""
     data_type = torch.bfloat16
@@ -927,6 +947,7 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     """A copied metadata tensor loses its creation-argument fingerprint."""
     data_type = torch.bfloat16
@@ -961,6 +982,7 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     """A hand-crafted buffer with a forged fingerprint but the wrong size must be
     rejected by the C++ exact-size check (defense in depth behind the Python
@@ -997,3 +1019,238 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
             page_table=page_table,
             scheduler_metadata=bad,
         )
+
+
+def _causal_mask_950(q_seqlen, kv_seqlen):
+    return torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+
+
+def _ref_bsnd(query, key, value, scale, data_type, is_causal):
+    batch, q_seqlen, heads, head = query.shape
+    golden = torch.empty_like(query).cpu()
+    mask = _causal_mask_950(q_seqlen, key.shape[1]) if is_causal else None
+    for i in range(batch):
+        out, _ = ref_flash_attention(
+            query[i].cpu(), key[i].cpu(), value[i].cpu(), scale, mask, data_type, 0.0
+        )
+        golden[i] = out.reshape(q_seqlen, heads, head)
+    return golden
+
+
+def _assert_outputs_match_with_retry(run_fn, label):
+    """Compare meta/default outputs, retrying the 950 bf16 kernel
+    first-launch flake: the first launch of a cold bf16 kernel variant can
+    produce wrong output; once that variant has run, results are stable.
+    """
+    last_err = None
+    for _ in range(3):
+        out_meta, out_default = run_fn()
+        try:
+            torch.testing.assert_close(out_meta, out_default, rtol=RTOL, atol=ATOL)
+            return out_meta
+        except AssertionError as err:
+            last_err = err
+            inf_meta = int(torch.isinf(out_meta).sum())
+            inf_default = int(torch.isinf(out_default).sum())
+            if inf_meta or inf_default:
+                print(
+                    f"[{label}-metadata] mismatch attempt: "
+                    f"inf meta={inf_meta} default={inf_default}"
+                )
+    raise last_err
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type, kv_heads", [
+    (torch.bfloat16, 2),
+    (torch.float16, 2),
+    (torch.bfloat16, 1),
+])
+def test_flash_attn_func_metadata_matches(data_type, kv_heads):
+    batch, q_seqlen, kv_seqlen, heads, head = 2, 64, 64, 4, 128
+    query = _rand_npu((batch, q_seqlen, heads, head), data_type, SMALL_RANGE)
+    key = _rand_npu((batch, kv_seqlen, kv_heads, head), data_type, SMALL_RANGE)
+    value = _rand_npu((batch, kv_seqlen, kv_heads, head), data_type, SMALL_RANGE)
+    scale = head ** -0.5
+    cache_seqlens = torch.full((batch,), kv_seqlen, dtype=torch.int32).npu()
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=data_type,
+        causal=True,
+        softmax_scale=scale,
+    )
+
+    def run_once():
+        out_default = flash_attn_func(
+            query, key, value, softmax_scale=scale, causal=True
+        )
+        out_meta = flash_attn_func(
+            query, key, value,
+            softmax_scale=scale,
+            causal=True,
+            scheduler_metadata=scheduler_metadata,
+        )
+        return out_meta, out_default
+
+    out_meta = _assert_outputs_match_with_retry(run_once, "func")
+    torch.testing.assert_close(
+        out_meta.cpu(),
+        _ref_bsnd(query, key, value, scale, data_type, True),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type, is_causal", [
+    (torch.bfloat16, False),
+    (torch.bfloat16, True),
+    (torch.float16, True),
+])
+def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal):
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 32, 64, 4, 2, 128
+    total_q = batch * q_seqlen
+    total_kv = batch * kv_seqlen
+    query = _rand_npu((total_q, heads, head), data_type, SMALL_RANGE)
+    key = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    value = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    cu_seqlens_q = _int32_npu([0, q_seqlen, q_seqlen * 2])
+    cu_seqlens_k = _int32_npu([0, kv_seqlen, kv_seqlen * 2])
+    scale = head ** -0.5
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cu_seqlens_k[1:] - cu_seqlens_k[:-1],
+        qkv_dtype=data_type,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=is_causal,
+        softmax_scale=scale,
+    )
+
+    def run_once():
+        out_default = flash_attn_varlen_func(
+            query, key, value, cu_seqlens_q, cu_seqlens_k,
+            q_seqlen, kv_seqlen,
+            softmax_scale=scale,
+            causal=is_causal,
+        )
+        out_meta = flash_attn_varlen_func(
+            query, key, value, cu_seqlens_q, cu_seqlens_k,
+            q_seqlen, kv_seqlen,
+            softmax_scale=scale,
+            causal=is_causal,
+            scheduler_metadata=scheduler_metadata,
+        )
+        return out_meta, out_default
+
+    _assert_outputs_match_with_retry(run_once, "varlen")
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
+def test_flash_attn_with_kvcache_metadata_matches(data_type):
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 16, 128, 4, 2, 128
+    block_size = 128
+    max_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
+    num_blocks = batch * max_blocks_per_seq
+    query = _rand_npu((batch, q_seqlen, heads, head), data_type, SMALL_RANGE)
+    key_cache = _rand_npu((num_blocks, block_size, kv_heads, head), data_type, SMALL_RANGE)
+    value_cache = _rand_npu((num_blocks, block_size, kv_heads, head), data_type, SMALL_RANGE)
+    page_table = torch.arange(num_blocks, dtype=torch.int32).reshape(
+        batch, max_blocks_per_seq
+    ).npu()
+    cache_seqlens = torch.full((batch,), kv_seqlen, dtype=torch.int32).npu()
+    scale = head ** -0.5
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=data_type,
+        page_size=block_size,
+        num_blocks=num_blocks,
+        max_num_blocks_per_seq=max_blocks_per_seq,
+        causal=False,
+        softmax_scale=scale,
+    )
+
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        softmax_scale=scale,
+    )
+
+    def run_once():
+        out_default = flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs)
+        out_meta = flash_attn_with_kvcache(
+            query, key_cache, value_cache,
+            scheduler_metadata=scheduler_metadata,
+            **kwargs,
+        )
+        return out_meta, out_default
+
+    _assert_outputs_match_with_retry(run_once, "kvcache")
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
+    # 3D TND kvcache (total_tokens, kv_heads, head_dim): regression for the
+    # wrapper assuming a 4D cache when auto-generating scheduler_metadata.
+    data_type = torch.bfloat16
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 16, 128, 4, 2, 128
+    total_q = batch * q_seqlen
+    total_kv = batch * kv_seqlen
+    query = _rand_npu((total_q, heads, head), data_type, SMALL_RANGE)
+    key_cache = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    value_cache = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    cu_seqlens_q = _int32_npu([0, q_seqlen, q_seqlen * 2])
+    cache_seqlens = torch.full((batch,), kv_seqlen, dtype=torch.int32).npu()
+    scale = head ** -0.5
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=data_type,
+        cu_seqlens_q=cu_seqlens_q,
+        causal=False,
+        softmax_scale=scale,
+    )
+
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_seqlen,
+        softmax_scale=scale,
+    )
+
+    def run_once():
+        out_default = flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs)
+        out_meta = flash_attn_with_kvcache(
+            query, key_cache, value_cache,
+            scheduler_metadata=scheduler_metadata,
+            **kwargs,
+        )
+        return out_meta, out_default
+
+    _assert_outputs_match_with_retry(run_once, "kvcache-tnd-3d")

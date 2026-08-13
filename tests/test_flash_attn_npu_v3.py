@@ -5,10 +5,7 @@ import os
 import torch
 import torch_npu
 import pytest
-if "Ascend950" in torch_npu.npu.get_device_name():
-    from flash_attn_npu_3 import flash_attn_with_kvcache
-else:
-    from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
@@ -588,8 +585,10 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_func only support Ascend910")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
+    if "Ascend950" in name and (softcap != 0.0):
+        pytest.skip("Ascend950 does not support softcap")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -600,6 +599,8 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     scale = 1.0 / (head_size ** 0.5)
     window_size_left = -1
     window_size_right = -1
+    if "Ascend950" in name and (window_size_right != -1 or window_size_left != -1):
+        pytest.skip("Ascend950 does not support SWA")
 
     ret = flash_attn_func(
         query,
@@ -634,7 +635,7 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
-    if return_attn_probs:
+    if return_attn_probs and "Ascend910" in name:
         torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 
@@ -681,8 +682,12 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
 def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_varlen_func only support Ascend910")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_varlen_func only supports Ascend910/Ascend950")
+    if "Ascend950" in name and (window_size_right != -1 or window_size_left != -1):
+        pytest.skip("Ascend950 does not support SWA")
+    if "Ascend950" in name and (softcap != 0.0):
+        pytest.skip("Ascend950 does not support softcap")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -770,7 +775,8 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
-    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    if "Ascend910" in name:
+        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 @pytest.mark.parametrize("data_type", [torch.float16])
 @pytest.mark.parametrize("num_heads", [16])
